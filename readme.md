@@ -1,4 +1,5 @@
 Too Chatty 🔥💧
+
 Opposites attract, messages too.
 Two desktop pets live on two different Windows computers: a fire pet and a water pet. Double-click one, type a message, and its friend on the other computer receives it.
 Quick start for new users
