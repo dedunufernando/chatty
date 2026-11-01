@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+.deskpet/
+assets/
+gift_config.json
