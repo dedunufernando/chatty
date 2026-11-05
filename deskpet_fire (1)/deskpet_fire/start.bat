@@ -8,19 +8,9 @@ if errorlevel 1 (
   pause
   exit /b
 )
-if not exist ".venv\Scripts\python.exe" (
+if not exist ".venv\Scripts\pythonw.exe" (
   echo Setting things up for the first time, one moment...
   python -m venv .venv
-)
-".venv\Scripts\python.exe" -c "import PySide6, psutil" >nul 2>nul
-if errorlevel 1 (
-  echo Installing the pet's parts, this takes about a minute...
   ".venv\Scripts\python.exe" -m pip install -r requirements.txt
-  if errorlevel 1 (
-    echo Install failed. Check the internet connection and run this file again.
-    pause
-    exit /b
-  )
 )
 start "" ".venv\Scripts\pythonw.exe" main.py
-exit

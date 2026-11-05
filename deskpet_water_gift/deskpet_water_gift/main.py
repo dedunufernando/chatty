@@ -13,6 +13,8 @@ import sys
 import os
 import re
 import json
+import traceback
+import faulthandler
 import math
 import hmac
 import random
@@ -24,7 +26,7 @@ import webbrowser
 from pathlib import Path
 
 import psutil
-from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRectF, QPointF, QLockFile
+from PySide6.QtCore import Qt, QTimer, QObject, Signal, QRectF, QPointF, QPoint, QLockFile
 from PySide6.QtGui import (QPainter, QPixmap, QColor, QImage, QRadialGradient,
                            QLinearGradient, QBrush, QPen)
 from PySide6.QtNetwork import QTcpServer, QTcpSocket, QHostAddress, QAbstractSocket
@@ -48,6 +50,10 @@ DEFAULTS = {
     "secret": "",            # shared passphrase, must be the same on both PCs
     "water_minutes": 45,
     "wander": True,          # pet strolls slowly around the desktop
+    "scale": 1.0,            # avatar size: 0.5 to 2.5 (1.0 = normal)
+    "opacity": 1.0,          # avatar opacity: 0.2 to 1.0
+    "chat_first": True,      # True: typing sends a chat message unless you say my name or start with /
+    "pos": None,             # last resting place [x, y], so the pet comes back where you left it
     "welcome_text": "",      # shown once on first launch (used by the gift package)
     "welcomed": False,
     "autostart_done": False,  # set after the pet installs its "start with Windows" entry once
@@ -93,6 +99,32 @@ def save_config(cfg):
 def to_seconds(n, unit):
     u = unit.lower()
     return n * 3600 if u.startswith("h") else n * 60 if u.startswith("m") else n
+
+
+_crash_file = None
+
+
+def install_crash_log():
+    """pythonw has no console, so write any error to ~/.deskpet/error.log. Helps find why a pet vanished."""
+    global _crash_file
+    DATA_DIR.mkdir(exist_ok=True)
+    log = DATA_DIR / "error.log"
+
+    def hook(t, v, tb):
+        try:
+            with log.open("a", encoding="utf-8") as f:
+                f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}]\n"
+                        + "".join(traceback.format_exception(t, v, tb)) + "\n")
+        except Exception:
+            pass
+    sys.excepthook = hook
+    try:
+        if log.exists() and log.stat().st_size > 200_000:
+            log.unlink()
+        _crash_file = log.open("a", encoding="utf-8")
+        faulthandler.enable(_crash_file)      # also records hard crashes
+    except Exception:
+        pass
 
 
 def launch(target):
@@ -222,7 +254,7 @@ class Link(QObject):
 PET_HEIGHT = 92
 
 
-def make_pet_pixmap(role, height=PET_HEIGHT):
+def make_pet_pixmap(role, height=PET_HEIGHT, ratio=1.0):
     """Load the artwork, shrink it, and bake in soft shading so the flat art looks 3D-ish."""
     pm = QPixmap(str(ASSETS / f"{role}.png"))
     if pm.isNull():
@@ -232,7 +264,7 @@ def make_pet_pixmap(role, height=PET_HEIGHT):
         q.setBrush(QColor("#ff8800" if role == "fire" else "#3cb4b4"))
         q.drawEllipse(5, 5, 140, 140)
         q.end()
-    pm = pm.scaledToHeight(height, Qt.SmoothTransformation)
+    pm = pm.scaledToHeight(max(8, int(height * ratio)), Qt.SmoothTransformation)
     img = pm.toImage().convertToFormat(QImage.Format_ARGB32_Premultiplied)
     w, h = img.width(), img.height()
     q = QPainter(img)
@@ -246,31 +278,43 @@ def make_pet_pixmap(role, height=PET_HEIGHT):
     shade.setColorAt(1, QColor(0, 0, 0, 80))
     q.fillRect(0, 0, w, h, QBrush(shade))
     q.end()
-    return QPixmap.fromImage(img)
+    out = QPixmap.fromImage(img)
+    out.setDevicePixelRatio(ratio)      # drawn at the logical size but with extra pixels, so it stays sharp
+    return out
 
 
 class PetCanvas(QWidget):
     W, H = 150, 170
 
-    def __init__(self, role):
+    def __init__(self, role, scale=1.0, opacity=1.0):
         super().__init__()
-        self.setFixedSize(self.W, self.H)
         self.role = role
-        self.pm = make_pet_pixmap(role)
+        self.k = 1.0
+        self.opacity = opacity
+        self.set_scale(scale)
         self.t = 0
         self.hop = 0
+        self.hop_h = 16
         self.wob_amp = 0.0
         self.wob_t = 0
         self.walking = False
         self.particles = []
 
-    def cheer(self):
+    def set_scale(self, k):
+        self.k = k
+        self.setFixedSize(int(self.W * k), int(self.H * k))
+        ratio = max(1.0, k * self.devicePixelRatioF())
+        self.pm = make_pet_pixmap(self.role, PET_HEIGHT, ratio)   # logical height stays PET_HEIGHT
+        self.update()
+
+    def cheer(self, gentle=False):
         self.hop = 20
-        self.wob_amp = 0.18
+        self.hop_h = 5 if gentle else 16
+        self.wob_amp = 0.07 if gentle else 0.18
 
     def lift(self):
         step = abs(math.sin(self.t * 0.10)) if self.walking else 0.0
-        jump = abs(math.sin(self.hop / 20 * math.pi)) * 16 if self.hop else 0.0
+        jump = abs(math.sin(self.hop / 20 * math.pi)) * self.hop_h if self.hop else 0.0
         return step * 5 + jump, step
 
     def tick(self):
@@ -294,7 +338,7 @@ class PetCanvas(QWidget):
         if len(self.particles) > 25:
             return
         lift, _ = self.lift()
-        top = self.H - 24 - lift - self.pm.height()
+        top = self.H - 24 - lift - self.pm.height() / self.pm.devicePixelRatio()
         cx = self.W / 2
         if self.role == "water" and self.t % 9 == 0:
             life = random.randint(60, 90)
@@ -311,6 +355,8 @@ class PetCanvas(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.SmoothPixmapTransform)
         p.setRenderHint(QPainter.Antialiasing)
+        p.scale(self.k, self.k)           # everything below is drawn in the base 150x170 space
+        p.setOpacity(self.opacity)        # fades the pet only, so speech bubbles stay readable
         ground = self.H - 24
         lift, step = self.lift()
         idle = math.sin(self.t / 10)
@@ -327,7 +373,9 @@ class PetCanvas(QWidget):
         p.save()
         p.translate(self.W / 2, ground - lift)
         p.scale(sx, sy)
-        p.drawPixmap(-self.pm.width() // 2, -self.pm.height(), self.pm)
+        pw = self.pm.width() / self.pm.devicePixelRatio()
+        ph = self.pm.height() / self.pm.devicePixelRatio()
+        p.drawPixmap(QPointF(-pw / 2, -ph), self.pm)
         p.restore()
 
         for pt in self.particles:
@@ -348,6 +396,12 @@ class PetCanvas(QWidget):
 
 
 # ---------------------------------------------------------------- main window
+BUBBLE_STYLE = ("background:white; color:#222; border:3px solid #ccc; border-radius:14px;"
+                "padding:10px; font-size:17px;")
+COMPACT_STYLE = ("background:rgba(255,255,255,235); color:#333; border:2px solid #cfe; border-radius:11px;"
+                 "padding:6px 8px; font-size:13px;")
+
+
 class PetWindow(QWidget):
     def __init__(self):
         super().__init__()
@@ -365,9 +419,10 @@ class PetWindow(QWidget):
         self.menu_open = False
         self.target = None
         self.rest = 60
-        area = QApplication.primaryScreen().availableGeometry()
-        self.fcx = float(area.right() - 90)     # pet's horizontal centre
-        self.fb = float(area.bottom() - 30)     # bottom edge of the window (pet stands here)
+        self.moved = False
+        self.cfg["scale"] = min(2.5, max(0.5, float(self.cfg.get("scale", 1.0))))
+        self.cfg["opacity"] = min(1.0, max(0.2, float(self.cfg.get("opacity", 1.0))))
+        self.fcx, self.fb = self.start_position()   # pet's horizontal centre, bottom edge of the window
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -375,13 +430,11 @@ class PetWindow(QWidget):
         self.bubble = QLabel("")
         self.bubble.setWordWrap(True)
         self.bubble.setFixedWidth(300)
-        self.bubble.setStyleSheet(
-            "background:white; color:#222; border:3px solid #ccc; border-radius:14px;"
-            "padding:10px; font-size:17px;")
+        self.bubble.setStyleSheet(BUBBLE_STYLE)
         self.bubble.hide()
         layout.addWidget(self.bubble, alignment=Qt.AlignHCenter)
 
-        self.canvas = PetCanvas(self.cfg["role"])
+        self.canvas = PetCanvas(self.cfg["role"], self.cfg["scale"], self.cfg["opacity"])
         layout.addWidget(self.canvas, alignment=Qt.AlignHCenter)
 
         self.input = QLineEdit()
@@ -407,6 +460,10 @@ class PetWindow(QWidget):
         self.input_timer.setSingleShot(True)
         self.input_timer.timeout.connect(self.close_input)
 
+        self.watch_timer = QTimer(self)             # keeps the pet from ever getting lost off-screen
+        self.watch_timer.timeout.connect(self.watchdog)
+        self.watch_timer.start(3000)
+
         self.water_timer = QTimer(self)
         self.water_timer.timeout.connect(self.water_reminder)
         self.set_water_interval(self.cfg["water_minutes"])
@@ -431,8 +488,60 @@ class PetWindow(QWidget):
         self.adjustSize()
         self.place()
 
-    def place(self):
+    def screen_at(self, x, y):
+        """The screen the point is on (or the nearest one), so the pet stays on the monitor it is on."""
+        pt = QPoint(int(x), int(y))
+        best, best_d = None, None
+        for sc in QApplication.screens():
+            g = sc.geometry()
+            if g.contains(pt):
+                return sc
+            dx = max(g.left() - pt.x(), 0, pt.x() - g.right())
+            dy = max(g.top() - pt.y(), 0, pt.y() - g.bottom())
+            d = dx * dx + dy * dy
+            if best_d is None or d < best_d:
+                best, best_d = sc, d
+        return best or QApplication.primaryScreen()
+
+    def cur_area(self):
+        return self.screen_at(self.fcx, self.fb - 20).availableGeometry()
+
+    def start_position(self):
+        pos = self.cfg.get("pos")
+        try:
+            x, y = float(pos[0]), float(pos[1])
+            if any(sc.geometry().contains(QPoint(int(x), int(y) - 20)) for sc in QApplication.screens()):
+                return x, y
+        except Exception:
+            pass
         area = QApplication.primaryScreen().availableGeometry()
+        return float(area.right() - 90), float(area.bottom() - 30)
+
+    def remember_position(self):
+        self.cfg["pos"] = [round(self.fcx), round(self.fb)]
+        save_config(self.cfg)
+
+    def watchdog(self):
+        """Runs every few seconds: bring the pet back if it got hidden, lost off-screen, or covered."""
+        if self.menu_open:
+            return
+        if not self.isVisible():
+            self.show()
+        if self.drag_offset is not None:
+            return
+        if not any(sc.geometry().contains(QPoint(int(self.fcx), int(self.fb - 20)))
+                   for sc in QApplication.screens()):
+            area = QApplication.primaryScreen().availableGeometry()   # its monitor was unplugged
+            self.fcx, self.fb = float(area.right() - 90), float(area.bottom() - 30)
+            self.target = None
+            self.place()
+        elif not any(sc.geometry().intersects(self.frameGeometry()) for sc in QApplication.screens()):
+            self.place()
+        if not self.input.isVisible():
+            self.raise_()
+
+    def place(self):
+        area = self.cur_area()
         x = int(self.fcx - self.width() / 2)
         y = int(self.fb - self.height())
         x = max(area.left(), min(x, area.right() - self.width()))
@@ -455,10 +564,12 @@ class PetWindow(QWidget):
             self.rest -= 1
             self.canvas.walking = False
             return
-        area = QApplication.primaryScreen().availableGeometry()
+        area = self.cur_area()                       # only wander on the monitor the pet is on
         if self.target is None:
-            self.target = (random.uniform(area.left() + 90, area.right() - 90),
-                           random.uniform(area.top() + 260, area.bottom() - 10))
+            half = self.canvas.width() / 2 + 10
+            top = min(area.top() + self.canvas.height() + 120, area.bottom() - 40)
+            self.target = (random.uniform(area.left() + half, max(area.left() + half, area.right() - half)),
+                           random.uniform(top, area.bottom() - 10))
         tx, ty = self.target
         dx, dy = tx - self.fcx, ty - self.fb
         d = math.hypot(dx, dy)
@@ -466,6 +577,7 @@ class PetWindow(QWidget):
             self.target = None
             self.rest = random.randint(150, 400)   # rest 5-12 seconds
             self.canvas.walking = False
+            self.remember_position()
             return
         speed = 0.8                                  # slow, gentle stroll
         self.fcx += dx / d * speed
@@ -499,7 +611,6 @@ class PetWindow(QWidget):
         self.link.stop()
         self.cfg["role"] = ""
         self.setup_dialog()
-        self.canvas = self.canvas  # avatar changes after restart
         self.link = Link(self.cfg)
         self.link.message.connect(self.on_peer_message)
         self.link.status.connect(self.on_status)
@@ -507,12 +618,14 @@ class PetWindow(QWidget):
         self.say("Settings saved. Restart me if you changed which pet I am.")
 
     # ---------- speech ----------
-    def say(self, text, seconds=10):
+    def say(self, text, seconds=10, compact=False):
+        self.bubble.setStyleSheet(COMPACT_STYLE if compact else BUBBLE_STYLE)
+        self.bubble.setFixedWidth(230 if compact else 300)
         self.bubble.setText(text)
         self.bubble.show()
         QTimer.singleShot(0, self.relayout)
-        self.canvas.cheer()
-        self.bubble_timer.start(seconds * 1000)
+        self.canvas.cheer(gentle=compact)
+        self.bubble_timer.start(int(seconds * 1000))
 
     def hide_bubble(self):
         self.bubble.hide()
@@ -526,12 +639,39 @@ class PetWindow(QWidget):
     def on_peer_message(self, text):
         who = "Water" if self.cfg["role"] == "fire" else "Fire"
         self.log(f"{who}: {text}")
-        QApplication.beep()
-        self.say(f"💬 {who}: {text}", 20)
+        # quiet on purpose: no sound, a small bubble, and a click on it makes it go away
+        self.say(f"💬 {who}: {text}", min(15, max(6, 4 + len(text) / 10)), compact=True)
 
     def log(self, line):
         with CHAT_LOG.open("a", encoding="utf-8") as f:
             f.write(f"[{datetime.datetime.now():%Y-%m-%d %H:%M}] {line}\n")
+
+    def set_scale(self, k):
+        k = round(min(2.5, max(0.5, k)), 2)
+        self.cfg["scale"] = k
+        save_config(self.cfg)
+        self.canvas.set_scale(k)
+        QTimer.singleShot(0, self.relayout)
+
+    def nudge_scale(self, d):
+        self.set_scale(self.cfg["scale"] + d)
+
+    def set_opacity(self, o):
+        o = round(min(1.0, max(0.2, o)), 2)
+        self.cfg["opacity"] = o
+        save_config(self.cfg)
+        self.canvas.opacity = o
+        self.canvas.update()
+
+    def nudge_opacity(self, d):
+        self.set_opacity(self.cfg["opacity"] + d)
+
+    def recent_messages(self):
+        if CHAT_LOG.exists():
+            lines = CHAT_LOG.read_text(encoding="utf-8").strip().splitlines()[-5:]
+            if lines:
+                return "\n".join(lines)
+        return "No messages yet."
 
     def water_reminder(self):
         self.say(random.choice(["Time to drink some water! 💧",
@@ -567,11 +707,29 @@ class PetWindow(QWidget):
         m = re.match(r"(?:say|msg|tell)\s+(.+)", text, re.I)
         if m:
             return self.send_chat(m.group(1))
-        reply = self.run_command(text)
+        cmd = self.command_part(text)
+        if cmd is None:
+            return self.send_chat(text)
+        reply = self.run_command(cmd)
         if reply is None:
             self.send_chat(text)
         else:
             self.say(reply)
+
+    def command_part(self, text):
+        """Returns the command text if this was meant for the pet, else None (so it is sent as chat).
+        With chat_first on, only '/command' or '<nickname> command' counts as a command."""
+        if not self.cfg.get("chat_first", True):
+            return text
+        if text.startswith("/"):
+            return text[1:].strip()
+        nick, low = self.cfg["nickname"].lower(), text.lower()
+        if low == nick:
+            return ""
+        for sep in (" ", ",", ":", "!"):
+            if low.startswith(nick + sep):
+                return text[len(nick) + 1:].strip(" ,:!")
+        return None
 
     def send_chat(self, text):
         if self.link.send(text):
@@ -591,7 +749,8 @@ class PetWindow(QWidget):
             return "Yes? I'm listening!"
 
         if low in ("help", "?", "commands"):
-            return ("Anything I don't know as a command gets sent to the other pet. Commands: "
+            return ("Just type to chat with the other pet. For me, start with my name or a slash, "
+                    "like '" + self.cfg['nickname'] + ", time' or '/time'. Commands: size 120, opacity 60, "
                     "search <text>, youtube <text>, open google/github/notepad, "
                     "remind me to <x> in 10 minutes, timer 5 minutes, water every 30 minutes, "
                     "note <text>, show notes, cpu, ram, battery, time, date, joke, status, "
@@ -629,6 +788,20 @@ class PetWindow(QWidget):
             secs = to_seconds(int(m.group(1)), m.group(2))
             QTimer.singleShot(secs * 1000, lambda: self.say("Time's up! ⏰", 20))
             return f"Timer set for {m.group(1)} {m.group(2)}."
+        m = re.match(r"(?:size|scale)\s+(\d+)\s*%?$", low)
+        if m:
+            self.set_scale(int(m.group(1)) / 100)
+            return f"Size is now {int(self.cfg['scale'] * 100)}%."
+        m = re.match(r"opacity\s+(\d+)\s*%?$", low)
+        if m:
+            self.set_opacity(int(m.group(1)) / 100)
+            return f"Opacity is now {int(self.cfg['opacity'] * 100)}%."
+        if low in ("bigger", "grow"):
+            self.nudge_scale(0.15)
+            return f"Size is now {int(self.cfg['scale'] * 100)}%."
+        if low in ("smaller", "shrink"):
+            self.nudge_scale(-0.15)
+            return f"Size is now {int(self.cfg['scale'] * 100)}%."
         m = re.match(r"water every (\d+)", low)
         if m:
             self.set_water_interval(max(1, int(m.group(1))))
@@ -661,7 +834,7 @@ class PetWindow(QWidget):
             self.cfg["nickname"] = m.group(1).strip().title()
             save_config(self.cfg)
             return f"Call me {self.cfg['nickname']} from now on!"
-        if low in ("quit", "exit", "bye", "goodbye"):
+        if low in ("quit", "quit pet"):
             QTimer.singleShot(1200, QApplication.quit)
             return "Bye bye! 👋"
         return None
@@ -670,6 +843,7 @@ class PetWindow(QWidget):
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:
             self.drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.moved = False
 
     def mouseMoveEvent(self, e):
         if self.drag_offset is not None and e.buttons() & Qt.LeftButton:
@@ -677,9 +851,28 @@ class PetWindow(QWidget):
             self.fcx = self.x() + self.width() / 2
             self.fb = self.y() + self.height()
             self.target = None
+            self.moved = True
 
-    def mouseReleaseEvent(self, _):
+    def mouseReleaseEvent(self, e):
+        was_drag = self.drag_offset is not None
         self.drag_offset = None
+        if not was_drag:
+            return
+        if self.moved:
+            self.place()                  # settle fully inside whichever monitor it was dropped on
+            self.remember_position()
+        elif self.bubble.isVisible() and self.bubble.geometry().contains(e.position().toPoint()):
+            self.hide_bubble()            # a plain click on the speech bubble dismisses it
+
+    def wheelEvent(self, e):
+        d = e.angleDelta().y() or e.angleDelta().x()
+        if not d or not (e.modifiers() & Qt.ControlModifier):
+            return                        # Ctrl + wheel = size, Ctrl + Shift + wheel = opacity
+        step = 1 if d > 0 else -1
+        if e.modifiers() & Qt.ShiftModifier:
+            self.nudge_opacity(0.1 * step)
+        else:
+            self.nudge_scale(0.1 * step)
 
     def mouseDoubleClickEvent(self, _):
         self.open_input()
@@ -688,10 +881,25 @@ class PetWindow(QWidget):
         menu = QMenu(self)
         menu.addAction("Type a command / message", self.open_input)
         menu.addAction("Connection status", lambda: self.say(f"Connection: {self.net_status}", 5))
+        menu.addAction("Recent messages", lambda: self.say(self.recent_messages(), 15))
         menu.addAction("Drink water now 💧", self.water_reminder)
+        sz = menu.addMenu("Size")
+        for label, val in (("Tiny", 0.6), ("Small", 0.8), ("Normal", 1.0), ("Large", 1.3), ("Huge", 1.7)):
+            a = sz.addAction(f"{label} ({int(val * 100)}%)", lambda *_, v=val: self.set_scale(v))
+            a.setCheckable(True)
+            a.setChecked(abs(self.cfg["scale"] - val) < 0.05)
+        sz.addSeparator()
+        sz.addAction("Bigger", lambda *_: self.nudge_scale(0.1))
+        sz.addAction("Smaller", lambda *_: self.nudge_scale(-0.1))
+        op = menu.addMenu("Opacity")
+        for pct in (100, 80, 60, 40, 25):
+            a = op.addAction(f"{pct}%", lambda *_, v=pct / 100: self.set_opacity(v))
+            a.setCheckable(True)
+            a.setChecked(abs(self.cfg["opacity"] - pct / 100) < 0.05)
         menu.addAction("Stop wandering" if self.cfg.get("wander", True) else "Wander around",
                        self.toggle_wander)
         menu.addAction("Start with Windows", lambda: self.say(self.toggle_startup(), 6))
+        menu.addAction("Help", lambda *_: self.say(self.run_command("help"), 20))
         menu.addAction("Chat settings...", self.reconfigure)
         menu.addSeparator()
         menu.addAction("Quit", QApplication.quit)
@@ -743,6 +951,7 @@ class PetWindow(QWidget):
 
 
 def main():
+    install_crash_log()
     app = QApplication(sys.argv)
     DATA_DIR.mkdir(exist_ok=True)
     lock = QLockFile(str(DATA_DIR / "deskpet.lock"))   # only one pet at a time
@@ -751,6 +960,8 @@ def main():
     pet = PetWindow()
     pet.show()
     pet.relayout()
+    for sig in (app.screenAdded, app.screenRemoved, app.primaryScreenChanged):
+        sig.connect(lambda *_: QTimer.singleShot(800, pet.watchdog))   # monitors plugged or unplugged
     code = app.exec()
     lock.unlock()
     sys.exit(code)
